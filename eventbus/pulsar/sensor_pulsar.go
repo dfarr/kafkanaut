@@ -2,8 +2,9 @@ package pulsar
 
 import "context"
 import "encoding/json"
+import "errors"
 import "fmt"
-import "strings"
+import "regexp"
 import "sync"
 import "time"
 
@@ -51,10 +52,7 @@ func (d *SensorDriver) Initialize() error {
 	consumer, err := client.Subscribe(pulsar.ConsumerOptions{
 		Topics: []string{"foo", "bar", "baz"},
 		SubscriptionName: d.Sensor.Name,
-		Type: pulsar.KeyShared,
-		KeySharedPolicy: &pulsar.KeySharedPolicy{
-			Mode: pulsar.KeySharedPolicyModeAutoSplit,
-		},
+		Type: pulsar.Failover,
 	})
 
 	if err != nil {
@@ -85,8 +83,8 @@ func (d *SensorDriver) Initialize() error {
 	d.barProducer = barProducer
 	d.bazProducer = bazProducer
 
-	// fan out handler
-	go d.Foo()
+	// TODO: should this be done in initialize?
+	go d.FanOut()
 
 	return nil
 }
@@ -139,7 +137,12 @@ func (d *SensorDriver) listen(ctx context.Context) {
 
 		fmt.Printf("Received: topic=%s key=%s payload=%s\n", msg.Topic(), msg.Key(), string(msg.Payload()))
 
-		topic := extractTopic(msg.Topic())
+		topic, err := extractTopic(msg.Topic())
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
 		key := fmt.Sprintf("%s/%s", topic, msg.Key())
 
 		if handler, ok := d.handlers[key]; ok {
@@ -174,8 +177,10 @@ func (d *SensorDriver) listen(ctx context.Context) {
 	}
 }
 
-// TODO: make this better
-func (d *SensorDriver) Foo() {
+func (d *SensorDriver) FanOut() {
+	// Register a single handler for all messages on topic 'foo'.
+	// This could be optimized by creating handlers on seperate
+	// go routines for each sensor dependency.
 	ch := d.Register("foo", "")
 	defer close(ch)
 
@@ -221,12 +226,19 @@ func (d *SensorDriver) Register(topic string, key string) chan Request {
 
 func (d *SensorDriver) isReady() bool {
 	// TODO: fix
-	total := 2*len(d.Sensor.Triggers) + 1
+	// *2 for bar/baz topic handlers (per trigger)
+	// +1 for the foo topic handler
+	total := len(d.Sensor.Triggers)*2 + 1
 
 	return len(d.handlers) == total
 }
 
-func extractTopic(topic string) string {
-	parts := strings.Split(topic, "/")
-	return parts[len(parts)-1]
+func extractTopic(topic string) (string, error) {
+	re := regexp.MustCompile(`^persistent:\/\/public\/default\/(.*)-partition-\d*$`)
+
+	if !re.MatchString(topic) {
+		return "", errors.New("Invalid topic")
+	}
+
+	return re.FindStringSubmatch(topic)[1], nil
 }
