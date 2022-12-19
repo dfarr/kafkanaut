@@ -1,42 +1,32 @@
 package pulsar
 
-import "context"
-import "encoding/json"
-import "errors"
-import "fmt"
-import "regexp"
-import "sync"
-import "time"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"sync"
+	"time"
 
-import "github.com/apache/pulsar-client-go/pulsar"
-import cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/apache/pulsar-client-go/pulsar"
 
-import . "github.com/dfarr/kafkanaut/sensor"
-import "github.com/dfarr/kafkanaut/eventbus/common"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 
+	"github.com/dfarr/kafkanaut/eventbus/common"
+	. "github.com/dfarr/kafkanaut/sensor"
+)
 
 type SensorDriver struct {
 	sync.Mutex
-	Sensor      Sensor
-	Broker      string
-	handlers    map[string]chan Request
-	client      pulsar.Client
-	consumer    pulsar.Consumer
-	barProducer pulsar.Producer
-	bazProducer pulsar.Producer
-	open        bool
-}
-
-type Request struct {
-	msg           pulsar.Message
-	ch            chan Response
-}
-
-type Response struct {
-	msgs          []*pulsar.ProducerMessage
-	acks          []pulsar.MessageID
-	producer      pulsar.Producer
-	err           error
+	Sensor          Sensor
+	Broker          string
+	client          pulsar.Client
+	consumer        pulsar.Consumer
+	triggerProducer pulsar.Producer
+	actionProducer  pulsar.Producer
+	handlers        map[string]*TriggerConnection
+	open            bool
 }
 
 func (d *SensorDriver) Initialize() error {
@@ -50,9 +40,9 @@ func (d *SensorDriver) Initialize() error {
 
 	// consumer
 	consumer, err := client.Subscribe(pulsar.ConsumerOptions{
-		Topics: []string{"foo", "bar", "baz"},
+		Topics:           []string{"event", "trigger", "action"},
 		SubscriptionName: d.Sensor.Name,
-		Type: pulsar.Failover,
+		Type:             pulsar.Failover,
 	})
 
 	if err != nil {
@@ -60,8 +50,8 @@ func (d *SensorDriver) Initialize() error {
 	}
 
 	// producers
-	barProducer, err := client.CreateProducer(pulsar.ProducerOptions{
-		Topic: "bar",
+	triggerProducer, err := client.CreateProducer(pulsar.ProducerOptions{
+		Topic:              "trigger",
 		BatcherBuilderType: pulsar.KeyBasedBatchBuilder,
 	})
 
@@ -69,8 +59,8 @@ func (d *SensorDriver) Initialize() error {
 		return err
 	}
 
-	bazProducer, err := client.CreateProducer(pulsar.ProducerOptions{
-		Topic: "baz",
+	actionProducer, err := client.CreateProducer(pulsar.ProducerOptions{
+		Topic:              "action",
 		BatcherBuilderType: pulsar.KeyBasedBatchBuilder,
 	})
 
@@ -80,24 +70,17 @@ func (d *SensorDriver) Initialize() error {
 
 	d.client = client
 	d.consumer = consumer
-	d.barProducer = barProducer
-	d.bazProducer = bazProducer
-
-	// TODO: should this be done in initialize?
-	go d.FanOut()
+	d.triggerProducer = triggerProducer
+	d.actionProducer = actionProducer
 
 	return nil
 }
 
 func (d *SensorDriver) Close() error {
 	d.consumer.Close()
-	d.barProducer.Close()
-	d.bazProducer.Close()
+	d.triggerProducer.Close()
+	d.actionProducer.Close()
 	d.client.Close()
-
-	for _, handler := range d.handlers {
-		close(handler)
-	}
 
 	return nil
 }
@@ -109,11 +92,11 @@ func (d *SensorDriver) Connect(ctx context.Context, triggerName string, depExpre
 	}
 
 	return &TriggerConnection{
-		driver: d,
-		sensorName: d.Sensor.Name,
-		triggerName: triggerName,
+		driver:        d,
+		sensorName:    d.Sensor.Name,
+		triggerName:   triggerName,
 		depExpression: depExpression,
-		dependencies: dependencies,
+		dependencies:  dependencies,
 	}, nil
 }
 
@@ -143,101 +126,106 @@ func (d *SensorDriver) listen(ctx context.Context) {
 			return
 		}
 
-		key := fmt.Sprintf("%s/%s", topic, msg.Key())
-
-		if handler, ok := d.handlers[key]; ok {
-			ch := make(chan Response)
-
-			handler <- Request{msg, ch}
-
-			// do this asynchronously
-			go func(ch chan Response) {
-				res := <-ch
-				defer close(ch)
-
-				if res.err != nil {
-					fmt.Println(res.err)
-					return
-				}
-
-				// pretend this is in a transaction
-
-				for _, msg := range res.msgs {
-					res.producer.Send(ctx, msg)
-				}
-
-				for _, ack := range res.acks {
-					d.consumer.AckID(ack)
-				}
-			}(ch)
-
-		} else {
-			d.consumer.Ack(msg)
-		}
-	}
-}
-
-func (d *SensorDriver) FanOut() {
-	// Register a single handler for all messages on topic 'foo'.
-	// This could be optimized by creating handlers on seperate
-	// go routines for each sensor dependency.
-	ch := d.Register("foo", "")
-	defer close(ch)
-
-	for {
-		req := <-ch
-
-		var event *cloudevents.Event
-		if err := json.Unmarshal(req.msg.Payload(), &event); err != nil {
-			req.ch <- Response{nil, nil, nil, err}
-			continue
-		}
-
-		var msgs []*pulsar.ProducerMessage
-		for _, trigger := range d.Sensor.Triggers {
-			for _, dependency := range trigger.Dependencies {
-				if dependency.EventSourceName == event.Source() && dependency.EventName == event.Subject() {
-					msgs = append(msgs, &pulsar.ProducerMessage{
-						Key: trigger.Name,
-						Payload: req.msg.Payload(),
-					})
-				}
+		if topic == "event" {
+			if err := d.Event(ctx, msg); err != nil {
+				fmt.Println(err)
 			}
 		}
 
-		req.ch <- Response{msgs, []pulsar.MessageID{req.msg.ID()}, d.barProducer, nil}
+		if topic == "trigger" {
+			if err := d.Trigger(ctx, msg); err != nil {
+				fmt.Println(err)
+			}
+		}
+
+		if topic == "action" {
+			if err := d.Action(ctx, msg); err != nil {
+				fmt.Println(err)
+			}
+		}
 	}
 }
 
-func (d *SensorDriver) Register(topic string, key string) chan Request {
+func (d *SensorDriver) Register(handler *TriggerConnection) {
 	d.Lock()
 	defer d.Unlock()
 
-	ch := make(chan Request, 100)
-
 	if d.handlers == nil {
-		d.handlers = make(map[string]chan Request)
+		d.handlers = make(map[string]*TriggerConnection)
 	}
 
-	d.handlers[fmt.Sprintf("%s/%s", topic, key)] = ch
-
-	return ch
+	d.handlers[handler.Name()] = handler
 }
 
 func (d *SensorDriver) isReady() bool {
-	// TODO: fix
-	// *2 for bar/baz topic handlers (per trigger)
-	// +1 for the foo topic handler
-	total := len(d.Sensor.Triggers)*2 + 1
+	return len(d.handlers) == len(d.Sensor.Triggers)
+}
 
-	return len(d.handlers) == total
+func (d *SensorDriver) Event(ctx context.Context, msg pulsar.Message) error {
+	var event *cloudevents.Event
+	if err := json.Unmarshal(msg.Payload(), &event); err != nil {
+		return err
+	}
+
+	// pretend this happens in a transaction
+
+	for _, trigger := range d.Sensor.Triggers {
+		for _, dependency := range trigger.Dependencies {
+			if dependency.EventSourceName == event.Source() && dependency.EventName == event.Subject() {
+				d.triggerProducer.Send(ctx, &pulsar.ProducerMessage{
+					Key:     trigger.Name,
+					Payload: msg.Payload(),
+				})
+			}
+		}
+	}
+
+	return d.consumer.Ack(msg)
+}
+
+func (d *SensorDriver) Trigger(ctx context.Context, msg pulsar.Message) error {
+	if handler, ok := d.handlers[msg.Key()]; ok {
+		if err := handler.Update(msg); err != nil {
+			return err
+		}
+
+		// pretend this happens in a transaction
+
+		if handler.Satisfied() {
+			actionMsg, err := handler.Action()
+			if err != nil {
+				return err
+			}
+
+			d.actionProducer.Send(ctx, actionMsg)
+			handler.Reset()
+		}
+
+		for _, id := range handler.MessageIDs() {
+			d.consumer.AckID(id)
+		}
+	} else {
+		d.consumer.Ack(msg)
+	}
+
+	return nil
+}
+
+func (d *SensorDriver) Action(ctx context.Context, msg pulsar.Message) error {
+	if handler, ok := d.handlers[msg.Key()]; ok {
+		if err := handler.Execute(msg); err != nil {
+			return err
+		}
+	}
+
+	return d.consumer.Ack(msg)
 }
 
 func extractTopic(topic string) (string, error) {
 	re := regexp.MustCompile(`^persistent:\/\/public\/default\/(.*)-partition-\d*$`)
 
 	if !re.MatchString(topic) {
-		return "", errors.New("Invalid topic")
+		return "", errors.New("invalid topic")
 	}
 
 	return re.FindStringSubmatch(topic)[1], nil

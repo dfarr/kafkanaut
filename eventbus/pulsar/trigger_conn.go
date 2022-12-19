@@ -1,71 +1,36 @@
 package pulsar
 
-import "context"
-import "encoding/json"
-import "fmt"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
 
-import "github.com/apache/pulsar-client-go/pulsar"
-import cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/apache/pulsar-client-go/pulsar"
 
-import . "github.com/dfarr/kafkanaut/sensor"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 
+	. "github.com/dfarr/kafkanaut/sensor"
+)
 
 type TriggerConnection struct {
-	driver          *SensorDriver
-	sensorName      string
-	triggerName     string
-	depExpression   string
-	dependencies    []Dependency
-	msgIDs          []pulsar.MessageID
-	events          []*EventPair
+	driver        *SensorDriver
+	sensorName    string
+	triggerName   string
+	depExpression string
+	dependencies  []Dependency
+	msgIDs        []pulsar.MessageID
+	events        []*EventPair
+	action        func(string, string, []*cloudevents.Event) error
 }
 
 type EventPair struct {
-	msgID           pulsar.MessageID
-	event           *cloudevents.Event
+	msgID pulsar.MessageID
+	event *cloudevents.Event
 }
 
-func (c *TriggerConnection) Subscribe(ctx context.Context, actionFn func(string, string, []*cloudevents.Event) error) error {
-	barCh := c.driver.Register("bar", c.triggerName)
-	bazCh := c.driver.Register("baz", c.triggerName)
-
-	defer close(barCh)
-	defer close(bazCh)
-
-	for {
-		select {
-		case req := <-barCh:
-			fmt.Println("Update:", c.triggerName)
-
-			if err := c.Update(req.msg); err != nil {
-				req.ch <- Response{nil, nil, nil, err}
-			} else {
-				req.ch <- Response{c.Msgs(), c.Acks(), c.driver.bazProducer, nil}
-			}
-		case req := <-bazCh:
-			fmt.Println("Triggered:", c.triggerName)
-
-			req.ch <- Response{nil, []pulsar.MessageID{req.msg.ID()}, nil, nil}
-
-			var action *cloudevents.Event
-			var events []*cloudevents.Event
-
-			if err := json.Unmarshal(req.msg.Payload(), &action); err != nil {
-				fmt.Println(err)
-				continue
-			}
-
-			if err := json.Unmarshal(action.Data(), &events); err != nil {
-				fmt.Println(err)
-				continue
-			}
-
-			if err := actionFn("Pulsar", c.triggerName, events); err != nil {
-				fmt.Println(err)
-				continue
-			}
-		}
-	}
+func (c *TriggerConnection) Subscribe(ctx context.Context, action func(string, string, []*cloudevents.Event) error) error {
+	c.action = action
+	c.driver.Register(c)
 
 	return nil
 }
@@ -78,6 +43,10 @@ func (c *TriggerConnection) IsClosed() bool {
 	return !c.driver.open
 }
 
+func (c *TriggerConnection) Name() string {
+	return c.triggerName
+}
+
 func (c *TriggerConnection) Update(msg pulsar.Message) error {
 	var event *cloudevents.Event
 	if err := json.Unmarshal(msg.Payload(), &event); err != nil {
@@ -88,7 +57,7 @@ func (c *TriggerConnection) Update(msg pulsar.Message) error {
 	eventPair := &EventPair{msg.ID(), event}
 
 	found := false
-	for i:=0; i<len(c.events); i++ {
+	for i := 0; i < len(c.events); i++ {
 		if c.events[i].event.Source() == event.Source() && c.events[i].event.Subject() == event.Subject() {
 			c.events[i] = eventPair
 			found = true
@@ -103,38 +72,11 @@ func (c *TriggerConnection) Update(msg pulsar.Message) error {
 	return nil
 }
 
-func (c *TriggerConnection) Msgs() []*pulsar.ProducerMessage {
-	var msgs []*pulsar.ProducerMessage
-
-	if len(c.events) == len(c.dependencies) {
-		var id string
-		var events []*cloudevents.Event
-		for _, eventPair := range c.events {
-			id = eventPair.event.ID()
-			events = append(events, eventPair.event)
-		}
-
-		event := cloudevents.NewEvent()
-		event.SetID(id)
-		event.SetSource(c.sensorName)
-		event.SetSubject(c.triggerName)
-		event.SetData(cloudevents.ApplicationJSON, events)
-
-		// TODO: handle error
-		payload, _ := json.Marshal(event)
-		msgs = append(msgs, &pulsar.ProducerMessage{
-			Key: c.triggerName,
-			Payload: payload,
-		})
-
-		// reset
-		c.events = []*EventPair{}
-	}
-
-	return msgs
+func (c *TriggerConnection) Satisfied() bool {
+	return len(c.events) == len(c.dependencies)
 }
 
-func (c *TriggerConnection) Acks() []pulsar.MessageID {
+func (c *TriggerConnection) MessageIDs() []pulsar.MessageID {
 	msgIDs := []pulsar.MessageID{}
 	i := 0
 
@@ -156,4 +98,53 @@ func (c *TriggerConnection) Acks() []pulsar.MessageID {
 	}
 
 	return msgIDs
+}
+
+func (c *TriggerConnection) Action() (*pulsar.ProducerMessage, error) {
+	if !c.Satisfied() {
+		return nil, nil
+	}
+
+	var id string
+	var events []*cloudevents.Event
+	for _, eventPair := range c.events {
+		id = eventPair.event.ID()
+		events = append(events, eventPair.event)
+	}
+
+	event := cloudevents.NewEvent()
+	event.SetID(id)
+	event.SetSource(c.sensorName)
+	event.SetSubject(c.triggerName)
+	event.SetData(cloudevents.ApplicationJSON, events)
+
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pulsar.ProducerMessage{
+		Key:     c.Name(),
+		Payload: payload,
+	}, nil
+}
+
+func (c *TriggerConnection) Reset() {
+	c.events = []*EventPair{}
+}
+
+func (c *TriggerConnection) Execute(msg pulsar.Message) error {
+	var action *cloudevents.Event
+	var events []*cloudevents.Event
+
+	if err := json.Unmarshal(msg.Payload(), &action); err != nil {
+		return err
+	}
+
+	if err := json.Unmarshal(action.Data(), &events); err != nil {
+		return err
+	}
+
+	fmt.Printf("Triggered: %s\n", c.triggerName)
+	return c.action("Pulsar", c.triggerName, events)
 }
