@@ -86,6 +86,9 @@ func (d *SensorDriver) Close() error {
 }
 
 func (d *SensorDriver) Connect(ctx context.Context, triggerName string, depExpression string, dependencies []Dependency) (common.TriggerConnection, error) {
+	d.Lock()
+	defer d.Unlock()
+
 	if !d.open {
 		d.open = true
 		go d.listen(ctx)
