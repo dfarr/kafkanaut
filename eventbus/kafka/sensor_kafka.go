@@ -1,27 +1,29 @@
 package kafka
 
-import "context"
-import "encoding/json"
-import "fmt"
-import "os"
-import "sync"
-import "time"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"sync"
+	"time"
 
-import "github.com/Shopify/sarama"
-import cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/Shopify/sarama"
 
-import . "github.com/dfarr/kafkanaut/sensor"
-import "github.com/dfarr/kafkanaut/eventbus/common"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 
+	"github.com/dfarr/kafkanaut/eventbus/common"
+	. "github.com/dfarr/kafkanaut/sensor"
+)
 
 type SensorDriver struct {
 	sync.Mutex
-	Sensor          Sensor
-	Brokers         []string
-	triggers        []*TriggerConnection
-	consumer        sarama.ConsumerGroup
-	producer        sarama.AsyncProducer
-	open            bool
+	Sensor   Sensor
+	Brokers  []string
+	consumer sarama.ConsumerGroup
+	producer sarama.AsyncProducer
+	handlers []*TriggerConnection
+	open     bool
 }
 
 func (d *SensorDriver) Initialize() error {
@@ -76,11 +78,11 @@ func (d *SensorDriver) Connect(ctx context.Context, triggerName string, depExpre
 	}
 
 	return &TriggerConnection{
-		driver: d,
-		sensorName: d.Sensor.Name,
-		triggerName: triggerName,
+		driver:        d,
+		sensorName:    d.Sensor.Name,
+		triggerName:   triggerName,
 		depExpression: depExpression,
-		dependencies: dependencies,
+		dependencies:  dependencies,
 	}, nil
 }
 
@@ -96,7 +98,7 @@ func (d *SensorDriver) listen(ctx context.Context) {
 			continue
 		}
 
-		if err := d.consumer.Consume(ctx, []string{"foo", "bar", "baz"}, d); err != nil {
+		if err := d.consumer.Consume(ctx, []string{"event", "trigger", "action"}, d); err != nil {
 			fmt.Println(err)
 			return
 		}
@@ -111,27 +113,27 @@ func (d *SensorDriver) listen(ctx context.Context) {
 func (d *SensorDriver) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for {
 		select {
-		case msg := <- claim.Messages():
+		case msg := <-claim.Messages():
 			fmt.Printf("Received: topic=%s partition=%d offset=%d\n", msg.Topic, msg.Partition, msg.Offset)
 
-			if msg.Topic == "foo" {
-				if err := d.Foo(msg, session); err != nil {
+			if msg.Topic == "event" {
+				if err := d.Event(msg, session); err != nil {
 					fmt.Println(err)
 				}
 			}
 
-			if msg.Topic == "bar" {
-				if err := d.Bar(msg, session); err != nil {
+			if msg.Topic == "trigger" {
+				if err := d.Trigger(msg, session); err != nil {
 					fmt.Println(err)
 				}
 			}
 
-			if msg.Topic == "baz" {
-				if err := d.Baz(msg, session); err != nil {
+			if msg.Topic == "action" {
+				if err := d.Action(msg, session); err != nil {
 					fmt.Println(err)
 				}
 			}
-		case <- session.Context().Done():
+		case <-session.Context().Done():
 			return nil
 		}
 	}
@@ -145,30 +147,30 @@ func (d *SensorDriver) Cleanup(session sarama.ConsumerGroupSession) error {
 	return nil
 }
 
-func (d *SensorDriver) Register(trigger *TriggerConnection) {
+func (d *SensorDriver) Register(handler *TriggerConnection) {
 	d.Lock()
 	defer d.Unlock()
 
 	found := false
 
-	for i:=0; i<len(d.triggers); i++ {
-		if d.triggers[i].triggerName == trigger.triggerName {
-			d.triggers[i] = trigger
+	for i := 0; i < len(d.handlers); i++ {
+		if d.handlers[i].Name() == handler.Name() {
+			d.handlers[i] = handler
 			found = true
 			break
 		}
 	}
 
 	if !found {
-		d.triggers = append(d.triggers, trigger)
+		d.handlers = append(d.handlers, handler)
 	}
 }
 
 func (d *SensorDriver) isReady() bool {
-	return len(d.triggers) == len(d.Sensor.Triggers)
+	return len(d.handlers) == len(d.Sensor.Triggers)
 }
 
-func (d *SensorDriver) Foo(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
+func (d *SensorDriver) Event(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
 	var event *cloudevents.Event
 
 	if err := json.Unmarshal(msg.Value, &event); err != nil {
@@ -195,7 +197,7 @@ func (d *SensorDriver) Foo(msg *sarama.ConsumerMessage, session sarama.ConsumerG
 		for _, dependency := range trigger.Dependencies {
 			if dependency.EventSourceName == event.Source() && dependency.EventName == event.Subject() {
 				d.producer.Input() <- &sarama.ProducerMessage{
-					Topic: "bar",
+					Topic: "trigger",
 					Key:   sarama.StringEncoder(trigger.Name),
 					Value: sarama.ByteEncoder(msg.Value),
 				}
@@ -213,80 +215,70 @@ func (d *SensorDriver) Foo(msg *sarama.ConsumerMessage, session sarama.ConsumerG
 	return nil
 }
 
-func (d *SensorDriver) Bar(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
-	offset := msg.Offset + 1
-	actions := []*sarama.ProducerMessage{}
+func (d *SensorDriver) Trigger(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
+	d.Lock()
+	defer d.Unlock()
 
-	for _, trigger := range d.triggers {
-		if trigger.triggerName == string(msg.Key) {
-			action, err := trigger.Handle(msg)
+	if err := d.producer.BeginTxn(); err != nil {
+		return err
+	}
+
+	offset := msg.Offset + 1
+
+	for _, handler := range d.handlers {
+		if handler.Name() == string(msg.Key) {
+			if err := handler.Update(msg); err != nil {
+				return err
+			}
+		}
+
+		if handler.Satisfied() {
+			actionMsg, err := handler.Action()
 			if err != nil {
 				return err
 			}
 
-			if action != nil {
-				value, err := json.Marshal(action)
-				if err != nil {
-					return err
-				}
-
-				actions = append(actions, &sarama.ProducerMessage{
-					Topic: "baz",
-					Key:   sarama.StringEncoder(trigger.triggerName),
-					Value: sarama.ByteEncoder(value),
-				})
-			}
+			d.producer.Input() <- actionMsg
+			handler.Reset()
 		}
 
-		offset = trigger.HighWatermark(msg.Partition, offset)
+		offset = handler.Offset(msg.Partition, offset)
 	}
 
-	if len(actions) > 0 {
-		d.Lock()
-		defer d.Unlock()
+	offsets := map[string][]*sarama.PartitionOffsetMetadata{
+		msg.Topic: {{
+			Partition: msg.Partition,
+			Offset:    offset,
+			Metadata:  nil,
+		}},
+	}
 
-		if err := d.producer.BeginTxn(); err != nil {
-			return err
-		}
+	if err := d.producer.AddOffsetsToTxn(offsets, d.Sensor.Name); err != nil {
+		fmt.Println(err)
+		d.handleTxnError(msg, session, err, func() error {
+			return d.producer.AddMessageToTxn(msg, d.Sensor.Name, nil)
+		})
+		return nil
+	}
 
-		for _, action := range actions {
-			d.producer.Input() <- action
-		}
-
-		metadata := ""
-		offsets := map[string][]*sarama.PartitionOffsetMetadata{
-			msg.Topic: {{
-				msg.Partition,
-				offset,
-				&metadata,
-			}},
-		}
-		if err := d.producer.AddOffsetsToTxn(offsets, d.Sensor.Name); err != nil {
-			fmt.Println(err)
-			d.handleTxnError(msg, session, err, func() error {
-				return d.producer.AddMessageToTxn(msg, d.Sensor.Name, nil)
-			})
-			return nil
-		}
-
-		if err := d.producer.CommitTxn(); err != nil {
-			fmt.Println(err)
-			d.handleTxnError(msg, session, err, func() error {
-				return d.producer.CommitTxn()
-			})
-		}
-	} else {
-		session.MarkOffset(msg.Topic, msg.Partition, offset, "")
-		session.Commit()
+	// If no messages are produced in the transaction, but offsets
+	// are bumped (which can happen) the transaction has no effect
+	// and the offsets remain set to what they were before, ignoring
+	// this for now.
+	if err := d.producer.CommitTxn(); err != nil {
+		fmt.Println(err)
+		d.handleTxnError(msg, session, err, func() error {
+			return d.producer.CommitTxn()
+		})
 	}
 
 	return nil
 }
 
-func (d *SensorDriver) Baz(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
-	for _, trigger := range d.triggers {
-		if trigger.triggerName == string(msg.Key) {
-			if err := trigger.Execute(msg); err != nil {
+func (d *SensorDriver) Action(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
+	for _, handler := range d.handlers {
+		if handler.Name() == string(msg.Key) {
+			if err := handler.Execute(msg); err != nil {
 				return err
 			}
 		}
