@@ -1,33 +1,34 @@
 package main
 
-import "bytes"
-import "context"
-import "encoding/json"
-import "fmt"
-import "os"
-import "net/http"
-import "sync"
-import "strings"
-import "time"
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
 
-import cloudevents "github.com/cloudevents/sdk-go/v2"
+	cloudevents "github.com/cloudevents/sdk-go/v2"
 
-import . "github.com/dfarr/kafkanaut/sensor"
-import "github.com/dfarr/kafkanaut/eventbus"
-
+	"github.com/dfarr/kafkanaut/eventbus"
+	. "github.com/dfarr/kafkanaut/sensor"
+)
 
 func main() {
 	// fake sensor
-	dep1 := Dependency{"d1", "es-1", "blue"}
-	dep2 := Dependency{"d2", "es-2", "yellow"}
-	dep3 := Dependency{"d3", "es-3", "red"}
+	dep1 := Dependency{Name: "d1", EventSourceName: "es-1", EventName: "blue"}
+	dep2 := Dependency{Name: "d2", EventSourceName: "es-2", EventName: "yellow"}
+	dep3 := Dependency{Name: "d3", EventSourceName: "es-3", EventName: "red"}
 
 	sensor := Sensor{
 		Name: "sensor-1",
 		Triggers: []Trigger{
-			Trigger{"trigger-1", []Dependency{dep1}},
-			Trigger{"trigger-2", []Dependency{dep1, dep2}},
-			Trigger{"trigger-3", []Dependency{dep1, dep2, dep3}},
+			{Name: "trigger-1", Dependencies: []Dependency{dep1}},
+			{Name: "trigger-2", Dependencies: []Dependency{dep1, dep2}},
+			{Name: "trigger-3", Dependencies: []Dependency{dep1, dep2, dep3}},
 		},
 	}
 
@@ -94,7 +95,7 @@ func action(kind string, trigger string, events []*cloudevents.Event) error {
 	}
 
 	body, _ := json.Marshal(map[string]string{
-		"text":  fmt.Sprintf("*%s*\n%s: ```%s```", kind, trigger, strings.Join(data, "\n")),
+		"text": fmt.Sprintf("*%s*\n%s: ```%s```", kind, trigger, strings.Join(data, "\n")),
 	})
 
 	res, err := http.Post(os.Getenv("SLACK"), "application/json", bytes.NewBuffer(body))

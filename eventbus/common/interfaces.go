@@ -1,10 +1,11 @@
 package common
 
-import "context"
+import (
+	"context"
 
-import cloudevents "github.com/cloudevents/sdk-go/v2"
-import . "github.com/dfarr/kafkanaut/sensor"
-
+	cloudevents "github.com/cloudevents/sdk-go/v2"
+	. "github.com/dfarr/kafkanaut/sensor"
+)
 
 type Connection interface {
 	Close() error
