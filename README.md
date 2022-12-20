@@ -3,6 +3,9 @@ An exploration of messaging systems with [Argo Events](https://argoproj.github.i
 
 Implements two alternative EventBus technologies: [Kafka](https://kafka.apache.org/) and [Pulsar](https://pulsar.apache.org/). Both implementations enable horizontal scaling of Argo Event's Sensor applications, something not currently possible with vanilla Argo Events.
 
+## Architecture
+![architecture](https://user-images.githubusercontent.com/1387834/208555850-fcf1fd54-656d-4d91-a5c8-2d0497f9aa47.png)
+
 ## Setup
 ### Slack
 A slack incoming webhook is required to run both the Kafka and Pulsar implementations. Follow [these instructions](https://slack.com/help/articles/115005265063-Incoming-webhooks-for-Slack) to set up a custom slack application with a webhook. Set the webhook URL as the `SLACK` environment variable when running the go program as described below.
