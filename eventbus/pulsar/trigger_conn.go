@@ -76,7 +76,7 @@ func (c *TriggerConnection) Satisfied() bool {
 	return len(c.events) == len(c.dependencies)
 }
 
-func (c *TriggerConnection) MessageIDs() []pulsar.MessageID {
+func (c *TriggerConnection) Ack() []pulsar.MessageID {
 	msgIDs := []pulsar.MessageID{}
 	i := 0
 

@@ -204,7 +204,7 @@ func (d *SensorDriver) Trigger(ctx context.Context, msg pulsar.Message) error {
 			handler.Reset()
 		}
 
-		for _, id := range handler.MessageIDs() {
+		for _, id := range handler.Ack() {
 			d.consumer.AckID(id)
 		}
 	} else {
