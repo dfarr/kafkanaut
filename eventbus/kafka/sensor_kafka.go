@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -18,12 +19,16 @@ import (
 
 type SensorDriver struct {
 	sync.Mutex
-	Sensor   Sensor
-	Brokers  []string
-	consumer sarama.ConsumerGroup
-	producer sarama.AsyncProducer
-	handlers []*TriggerConnection
-	open     bool
+	Sensor        Sensor
+	Brokers       []string
+	client        sarama.Client
+	offsetManager sarama.OffsetManager
+	consumer      sarama.ConsumerGroup
+	producer      sarama.AsyncProducer
+	handlers      []*TriggerConnection
+	metadata      map[string]string
+	open          bool
+	setup         bool
 }
 
 func (d *SensorDriver) Initialize() error {
@@ -40,16 +45,28 @@ func (d *SensorDriver) Initialize() error {
 	config.Producer.Transaction.ID = fmt.Sprintf("%s-%d", d.Sensor.Name, os.Getpid())
 	config.Net.MaxOpenRequests = 1
 
-	consumer, err := sarama.NewConsumerGroup(d.Brokers, d.Sensor.Name, config)
+	client, err := sarama.NewClient(d.Brokers, config)
 	if err != nil {
 		return err
 	}
 
-	producer, err := sarama.NewAsyncProducer(d.Brokers, config)
+	offsetManager, err := sarama.NewOffsetManagerFromClient(d.Sensor.Name, client)
 	if err != nil {
 		return err
 	}
 
+	consumer, err := sarama.NewConsumerGroupFromClient(d.Sensor.Name, client)
+	if err != nil {
+		return err
+	}
+
+	producer, err := sarama.NewAsyncProducerFromClient(client)
+	if err != nil {
+		return err
+	}
+
+	d.client = client
+	d.offsetManager = offsetManager
 	d.consumer = consumer
 	d.producer = producer
 
@@ -140,6 +157,30 @@ func (d *SensorDriver) ConsumeClaim(session sarama.ConsumerGroupSession, claim s
 }
 
 func (d *SensorDriver) Setup(session sarama.ConsumerGroupSession) error {
+	if d.metadata == nil {
+		d.metadata = map[string]string{}
+	}
+
+	for _, partition := range session.Claims()["action"] {
+		partitionOffsetManager, err := d.offsetManager.ManagePartition("action", partition)
+		if err != nil {
+			return err
+		}
+
+		_, md := partitionOffsetManager.NextOffset()
+
+		var metadata map[string]string
+		if err := json.Unmarshal([]byte(md), &metadata); err != nil {
+			continue
+		}
+
+		for trigger, id := range metadata {
+			d.metadata[trigger] = id
+		}
+	}
+
+	d.setup = true
+
 	return nil
 }
 
@@ -167,7 +208,7 @@ func (d *SensorDriver) Register(handler *TriggerConnection) {
 }
 
 func (d *SensorDriver) isReady() bool {
-	return len(d.handlers) == len(d.Sensor.Triggers)
+	return d.setup && len(d.handlers) == len(d.Sensor.Triggers)
 }
 
 func (d *SensorDriver) Event(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
@@ -238,6 +279,9 @@ func (d *SensorDriver) Trigger(msg *sarama.ConsumerMessage, session sarama.Consu
 				return err
 			}
 
+			// add header
+			actionMsg.Headers = []sarama.RecordHeader{{Key: []byte(""), Value: []byte(strconv.Itoa(int(msg.Offset)))}}
+
 			d.producer.Input() <- actionMsg
 			handler.Reset()
 		}
@@ -276,15 +320,29 @@ func (d *SensorDriver) Trigger(msg *sarama.ConsumerMessage, session sarama.Consu
 }
 
 func (d *SensorDriver) Action(msg *sarama.ConsumerMessage, session sarama.ConsumerGroupSession) error {
-	for _, handler := range d.handlers {
-		if handler.Name() == string(msg.Key) {
-			if err := handler.Execute(msg); err != nil {
-				return err
-			}
-		}
+	var event *cloudevents.Event
+	if err := json.Unmarshal(msg.Value, &event); err != nil {
+		return err
 	}
 
-	session.MarkMessage(msg, "")
+	id := d.metadata[string(msg.Key)]
+
+	if id != event.ID() {
+		for _, handler := range d.handlers {
+			if handler.Name() == string(msg.Key) {
+				if err := handler.Execute(msg); err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		fmt.Println("Already processed, skipping...")
+	}
+
+	d.metadata[string(msg.Key)] = event.ID()
+	metadata, _ := json.Marshal(d.metadata)
+
+	session.MarkMessage(msg, string(metadata))
 	session.Commit()
 
 	return nil
